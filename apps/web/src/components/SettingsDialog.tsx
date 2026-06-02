@@ -112,6 +112,15 @@ import { ByokModelField } from './byok/ByokModelField';
 import { ByokProviderBaseUrl } from './byok/ByokProviderBaseUrl';
 import { ByokProviderPicker } from './byok/ByokProviderPicker';
 import {
+  blockingByokDraftFields,
+  blockingByokDraftIssues,
+  cleanByokApiKey,
+  validateByokDraft,
+  type ByokDraftField,
+  type ByokDraftIssue,
+  type ByokDraftValidation,
+} from './byok/validation';
+import {
   setCritiqueTheaterEnabled,
   useCritiqueTheaterEnabled,
 } from './Theater';
@@ -290,7 +299,7 @@ type ProviderModelsState =
   | { status: 'running'; cacheKey: string }
   | { status: 'done'; cacheKey: string; result: ProviderModelsResponse };
 
-type ByokRequiredField = 'api_key' | 'base_url' | 'model';
+type ByokRequiredField = ByokDraftField;
 type ByokPreconditionAction = 'test';
 
 // Map a test result to the visual severity of its inline status node so
@@ -954,6 +963,7 @@ export function SettingsDialog({
   const providerTestRevisionRef = useRef(0);
   const providerModelsRevisionRef = useRef(0);
   const providerModelsFirstResetRef = useRef(true);
+  const deferAfterKeyCleanRef = useRef(false);
   const providerAutoTestKeyRef = useRef<string | null>(null);
   const apiKeyInputRef = useRef<HTMLInputElement | null>(null);
   const baseUrlInputRef = useRef<HTMLInputElement | null>(null);
@@ -1263,14 +1273,12 @@ export function SettingsDialog({
     if (providerTestState.status === 'running') {
       return;
     }
-    const missing = missingByokConnectionFields(cfg, {
-      requiresApiKey: byokRequiresApiKey,
-    });
-    if (missing.length > 0) {
+    const blockingIssues = blockingByokDraftIssues(byokDraftValidation);
+    if (blockingIssues.length > 0) {
       if (options.silentPreconditions) {
         return;
       }
-      showByokPreconditionNotice('test', missing);
+      showByokDraftValidationNotice('test', byokDraftValidation);
       const byokProviderId = byokProtocolToTracking(apiProtocol);
       if (byokProviderId) {
         trackSettingsByokTestResult(analytics.track, {
@@ -1298,7 +1306,7 @@ export function SettingsDialog({
         {
           protocol: apiProtocol,
           baseUrl: cfg.baseUrl,
-          apiKey: cfg.apiKey,
+          apiKey: cleanByokApiKey(cfg.apiKey),
           model: cfg.model,
           apiVersion:
             apiProtocol === 'azure'
@@ -1362,12 +1370,7 @@ export function SettingsDialog({
     if (providerTestState.status === 'running') {
       return;
     }
-    if (
-      missingByokConnectionFields(cfg, {
-        requiresApiKey: byokRequiresApiKey,
-      }).length > 0 ||
-      !baseUrlValid
-    ) {
+    if (blockingByokDraftIssues(byokDraftValidation).length > 0) {
       return;
     }
     const key = providerConnectionTestKey(apiProtocol, cfg);
@@ -1402,20 +1405,12 @@ export function SettingsDialog({
       }
       return;
     }
-    const missing = missingByokModelFetchFields(cfg);
-    if (missing.length > 0) {
+    const modelFetchBlockingIssues = blockingByokDraftIssues(
+      byokModelFetchDraftValidation,
+    );
+    if (modelFetchBlockingIssues.length > 0) {
       if (!options.silent) {
-        showByokPreconditionNotice('test', missing);
-      }
-      return;
-    }
-    if (!baseUrlValid) {
-      if (!options.silent) {
-        setByokPreconditionNotice({
-          action: 'test',
-          message: t('settings.fetchModelsInvalidBaseUrl'),
-        });
-        focusByokRequiredField('base_url');
+        showByokDraftValidationNotice('test', byokModelFetchDraftValidation);
       }
       return;
     }
@@ -1453,7 +1448,7 @@ export function SettingsDialog({
         {
           protocol: apiProtocol,
           baseUrl: cfg.baseUrl,
-          apiKey: cfg.apiKey,
+          apiKey: cleanByokApiKey(cfg.apiKey),
         },
         controller.signal,
       );
@@ -1627,6 +1622,52 @@ export function SettingsDialog({
       }),
     });
     focusByokRequiredField(fields[0]);
+  };
+  const byokDraftIssueMessage = (issue: ByokDraftIssue): string => {
+    switch (issue.code) {
+      case 'api_key_required':
+      case 'base_url_required':
+      case 'model_required':
+        return t('settings.testMissingFields', {
+          fields: byokRequiredLabel(issue.field),
+        });
+      case 'api_key_extra_whitespace':
+      case 'api_key_malformed':
+      case 'api_key_wrong_protocol':
+        return t('settings.apiKeyInvalid');
+      case 'base_url_invalid':
+        return t('settings.baseUrlInvalid');
+      default: {
+        const exhaustive: never = issue.code;
+        return exhaustive;
+      }
+    }
+  };
+  const showByokDraftValidationNotice = (
+    action: ByokPreconditionAction,
+    validation: ByokDraftValidation,
+  ) => {
+    const blockingFields = blockingByokDraftFields(validation);
+    if (blockingFields.length === 0) return;
+    const blockingIssues = blockingByokDraftIssues(validation);
+    const missingFields = blockingIssues
+      .filter((issue) =>
+        issue.code === 'api_key_required' ||
+        issue.code === 'base_url_required' ||
+        issue.code === 'model_required'
+      )
+      .map((issue) => issue.field);
+    if (missingFields.length > 0) {
+      showByokPreconditionNotice(action, missingFields);
+      return;
+    }
+    const firstIssue = blockingIssues[0];
+    if (!firstIssue) return;
+    setByokPreconditionNotice({
+      action,
+      message: byokDraftIssueMessage(firstIssue),
+    });
+    focusByokRequiredField(firstIssue.field);
   };
   // Autosave loop. Every committed edit to `cfg` schedules a debounced
   // sync to localStorage + the daemon. We keep a 400ms debounce so rapid
@@ -1815,6 +1856,30 @@ export function SettingsDialog({
     selectedProvider,
     cfg.baseUrl,
   );
+  const byokDraftValidation = useMemo(
+    () => validateByokDraft(
+      apiProtocol,
+      {
+        apiKey: cfg.apiKey,
+        baseUrl: cfg.baseUrl,
+        model: cfg.model,
+      },
+      { requiresApiKey: byokRequiresApiKey },
+    ),
+    [apiProtocol, byokRequiresApiKey, cfg.apiKey, cfg.baseUrl, cfg.model],
+  );
+  const byokModelFetchDraftValidation = useMemo(
+    () => validateByokDraft(
+      apiProtocol,
+      {
+        apiKey: cfg.apiKey,
+        baseUrl: cfg.baseUrl,
+        model: cfg.model,
+      },
+      { requiresApiKey: byokRequiresApiKey, requireModel: false },
+    ),
+    [apiProtocol, byokRequiresApiKey, cfg.apiKey, cfg.baseUrl, cfg.model],
+  );
   const providerModelsKey = useMemo(
     () => providerModelsCacheKey(
       apiProtocol,
@@ -1827,17 +1892,52 @@ export function SettingsDialog({
   const fetchedApiModelOptions =
     activeProviderModelsCache[providerModelsKey] ?? [];
   const commitProviderModelsInputs = () => {
-    if (missingByokModelFetchFields(cfg).length > 0 || !baseUrlValid) {
+    if (blockingByokDraftIssues(byokModelFetchDraftValidation).length > 0) {
       setProviderModelsCommittedKey(null);
       return;
     }
     setProviderModelsCommittedKey(providerModelsKey);
   };
+  const onByokKeyCommit = () => {
+    // Normalize the stored key on blur so the value that flows into the
+    // connection-test / model-fetch requests below (and back to the daemon
+    // via autosave) is already free of pasted whitespace / zero-width
+    // characters — otherwise a key like "sk-ant-...\n" would only raise a
+    // non-blocking warning yet still go out malformed over the wire.
+    const cleanedApiKey = cleanByokApiKey(cfg.apiKey);
+    if (cleanedApiKey !== cfg.apiKey) {
+      // Writing the cleaned key changes cfg.apiKey, which re-runs the reset
+      // effects above: one nulls providerModelsCommittedKey, the other bumps
+      // providerTestRevisionRef / clears providerAutoTestKeyRef. So committing
+      // the model key or starting the auto-test here would be clobbered — the
+      // model commit before the auto-fetch effect reads it, and the auto-test
+      // result dropped by the stale-revision guard. Defer both until the
+      // cleaned value has landed (effect below), otherwise account models
+      // never auto-load and the auto-test success/error never reaches the UI
+      // for the exact dirty-paste case this handles.
+      deferAfterKeyCleanRef.current = true;
+      updateApiConfig({ apiKey: cleanedApiKey });
+      return;
+    }
+    commitProviderModelsInputs();
+    handleAutoTestProvider();
+  };
+  useEffect(() => {
+    if (!deferAfterKeyCleanRef.current) return;
+    deferAfterKeyCleanRef.current = false;
+    if (blockingByokDraftIssues(byokModelFetchDraftValidation).length > 0) {
+      setProviderModelsCommittedKey(null);
+    } else {
+      setProviderModelsCommittedKey(providerModelsKey);
+    }
+    // Runs after the provider-test reset effect (declaration order) bumped the
+    // revision for the cleaned key, so this auto-test is not flagged stale.
+    handleAutoTestProvider();
+  }, [cfg.apiKey, byokModelFetchDraftValidation, providerModelsKey]);
   useEffect(() => {
     if (cfg.mode !== 'api') return;
     if (apiProtocol === 'azure' || apiProtocol === 'ollama') return;
-    if (missingByokModelFetchFields(cfg).length > 0) return;
-    if (!baseUrlValid) return;
+    if (blockingByokDraftIssues(byokModelFetchDraftValidation).length > 0) return;
     if (providerModelsCommittedKey !== providerModelsKey) return;
     const timer = window.setTimeout(() => {
       void handleFetchProviderModels({ silent: true });
@@ -1845,11 +1945,11 @@ export function SettingsDialog({
     return () => window.clearTimeout(timer);
   }, [
     apiProtocol,
-    baseUrlValid,
     cfg.apiKey,
     cfg.baseUrl,
     cfg.mode,
     cfg.apiVersion,
+    byokModelFetchDraftValidation,
     providerModelsCommittedKey,
     providerModelsKey,
   ]);
@@ -3205,10 +3305,7 @@ export function SettingsDialog({
                 renderTestMessage={(result) => renderTestMessage(result, 'api')}
                 requiresApiKey={byokRequiresApiKey}
                 showApiKey={showApiKey}
-                onBlur={() => {
-                  commitProviderModelsInputs();
-                  handleAutoTestProvider();
-                }}
+                onBlur={onByokKeyCommit}
                 onChange={(value) => updateApiConfig({ apiKey: value })}
                 onFocus={() => {
                   const byokProviderId = byokProtocolToTracking(apiProtocol);
